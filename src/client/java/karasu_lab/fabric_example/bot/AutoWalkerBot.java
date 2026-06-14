@@ -23,18 +23,9 @@ import java.util.Random;
  * {@link Pathfinder} for look-ahead routing. Movement uses the vanilla key
  * bindings so it behaves like genuine input.
  *
- * <p>Humanization model (no per-tick jitter):
- * <ul>
- *   <li>The aim target is a look-ahead point a couple of nodes down the path,
- *       so turns are gradual instead of snapping at every node.</li>
- *   <li>Rotation eases toward the target (proportional step that slows down as
- *       it gets close), like a real hand on a mouse.</li>
- *   <li>A slow, low-frequency drift adds a few degrees of natural sway instead
- *       of high-frequency shaking.</li>
- *   <li>Jumps only fire while on the ground, for climbs, raycast-detected
- *       obstacles and small gaps, with a short cooldown.</li>
- *   <li>Sprint comes in phases and pauses on sharp turns.</li>
- * </ul>
+ * <p>NOTE: the cargo-head auto-start trigger is temporarily disabled while the
+ * movement model is being trained. The bot only walks when started manually
+ * (toggle key). The {@link MovementRecorder} remains active for dataset capture.
  */
 public class AutoWalkerBot {
 	private static final float YAW_MAX_STEP = 14.0F;
@@ -75,10 +66,6 @@ public class AutoWalkerBot {
 	private int avoidTicks;
 	private int avoidDir; // -1 = strafe left, +1 = strafe right
 
-	// Trigger detection.
-	private int lastTriggerCount;
-	private boolean triggerInitialized;
-
 	public AutoWalkerBot(BotConfig config) {
 		this.config = config;
 	}
@@ -110,16 +97,8 @@ public class AutoWalkerBot {
 			return;
 		}
 
-		if (config.startOnTrigger) {
-			int count = countTriggerItems(player);
-			if (!triggerInitialized) {
-				lastTriggerCount = count;
-				triggerInitialized = true;
-			} else if (count > lastTriggerCount && !running) {
-				start();
-			}
-			lastTriggerCount = count;
-		}
+		// Cargo-head auto-start trigger is temporarily disabled while the model
+		// is being trained. Re-enable once movement is driven by the trained model.
 
 		if (!running) {
 			return;
@@ -417,37 +396,6 @@ public class AutoWalkerBot {
 			repathCooldown = 0;
 			stuckTicks = 0;
 		}
-	}
-
-	private int countTriggerItems(ClientPlayerEntity player) {
-		int count = 0;
-		for (ItemStack stack : player.getInventory().main) {
-			if (isTriggerItem(stack)) {
-				count += stack.getCount();
-			}
-		}
-		for (ItemStack stack : player.getInventory().offHand) {
-			if (isTriggerItem(stack)) {
-				count += stack.getCount();
-			}
-		}
-		return count;
-	}
-
-	/**
-	 * Matches the cargo head: a player head whose custom name contains the
-	 * configured text. Name matching is robust across servers that re-issue
-	 * the head texture/profile id.
-	 */
-	private boolean isTriggerItem(ItemStack stack) {
-		if (stack.isEmpty() || !stack.isOf(Items.PLAYER_HEAD)) {
-			return false;
-		}
-		Text name = stack.get(DataComponentTypes.CUSTOM_NAME);
-		if (name == null) {
-			return false;
-		}
-		return name.getString().contains("\u0413\u0440\u0443\u0437");
 	}
 
 	private void releaseMovement(MinecraftClient client) {
