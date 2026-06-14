@@ -1,6 +1,5 @@
 package karasu_lab.fabric_example.bot;
 
-import net.minecraft.block.BlockState;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.AbstractClientPlayerEntity;
 import net.minecraft.client.network.ClientPlayerEntity;
@@ -9,9 +8,12 @@ import net.minecraft.component.DataComponentTypes;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
 import net.minecraft.text.Text;
+import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.RaycastContext;
 
 import java.util.List;
 import java.util.Random;
@@ -21,7 +23,8 @@ import java.util.Random;
  * {@link Pathfinder} for look-ahead routing. Movement is performed through the
  * vanilla key bindings so it behaves like real input. Adds human-like touches:
  * smoothed rotation with jitter, variable sprint phases, sidestepping around
- * other players and stuck recovery.
+ * other players and stuck recovery. Uses a real voxel raycast to detect blocks
+ * directly ahead.
  */
 public class AutoWalkerBot {
 	private final BotConfig config;
@@ -229,19 +232,31 @@ public class AutoWalkerBot {
 		setKey(client.options.sprintKey, sprintPhase && horizontal > 1.0);
 	}
 
+	/**
+	 * Real voxel raycast: detects a block directly ahead at foot level while the
+	 * chest level is clear -> a jumpable obstacle.
+	 */
 	private boolean isObstacleAhead(MinecraftClient client, ClientPlayerEntity player) {
 		Vec3d look = Vec3d.fromPolar(0.0F, player.getYaw());
-		BlockPos ahead = BlockPos.ofFloored(
-				player.getX() + look.x * 0.6,
-				player.getY(),
-				player.getZ() + look.z * 0.6);
-		BlockState feet = client.world.getBlockState(ahead);
-		BlockState head = client.world.getBlockState(ahead.up());
-		BlockState above = client.world.getBlockState(ahead.up(2));
-		boolean feetBlocked = !feet.getCollisionShape(client.world, ahead).isEmpty();
-		boolean headFree = head.getCollisionShape(client.world, ahead.up()).isEmpty();
-		boolean aboveFree = above.getCollisionShape(client.world, ahead.up(2)).isEmpty();
-		return feetBlocked && headFree && aboveFree;
+		boolean footBlocked = raycastForward(client, player, player.getY() + 0.15, look, 1.2);
+		boolean chestBlocked = raycastForward(client, player, player.getY() + 1.2, look, 1.2);
+		return footBlocked && !chestBlocked;
+	}
+
+	/**
+	 * Casts a horizontal ray from the player at the given Y and reports whether
+	 * it hits a solid (collider) block within {@code dist} blocks.
+	 */
+	private boolean raycastForward(MinecraftClient client, ClientPlayerEntity player, double y, Vec3d look, double dist) {
+		Vec3d start = new Vec3d(player.getX(), y, player.getZ());
+		Vec3d end = start.add(look.x * dist, 0.0, look.z * dist);
+		BlockHitResult hit = client.world.raycast(new RaycastContext(
+				start,
+				end,
+				RaycastContext.ShapeType.COLLIDER,
+				RaycastContext.FluidHandling.NONE,
+				player));
+		return hit != null && hit.getType() == HitResult.Type.BLOCK;
 	}
 
 	private void handlePlayerAvoidance(MinecraftClient client, ClientPlayerEntity player) {
