@@ -20,13 +20,27 @@ import java.util.Random;
 
 /**
  * Drives the player from point A to point B (and back, cyclically) using the
- * {@link Pathfinder} for look-ahead routing. Movement is performed through the
- * vanilla key bindings so it behaves like real input. Adds human-like touches:
- * smoothed rotation with jitter, variable sprint phases, sidestepping around
- * other players and stuck recovery. Uses a real voxel raycast to detect blocks
- * directly ahead.
+ * {@link Pathfinder} for look-ahead routing. Movement uses the vanilla key
+ * bindings so it behaves like genuine input.
+ *
+ * <p>Humanization model (no per-tick jitter):
+ * <ul>
+ *   <li>The aim target is a look-ahead point a couple of nodes down the path,
+ *       so turns are gradual instead of snapping at every node.</li>
+ *   <li>Rotation eases toward the target (proportional step that slows down as
+ *       it gets close), like a real hand on a mouse.</li>
+ *   <li>A slow, low-frequency drift adds a few degrees of natural sway instead
+ *       of high-frequency shaking.</li>
+ *   <li>Jumps only fire while on the ground, for climbs, raycast-detected
+ *       obstacles and small gaps, with a short cooldown.</li>
+ *   <li>Sprint comes in phases and pauses on sharp turns.</li>
+ * </ul>
  */
 public class AutoWalkerBot {
+	private static final float YAW_MAX_STEP = 14.0F;
+	private static final float PITCH_MAX_STEP = 7.0F;
+	private static final float TURN_EASE = 0.35F;
+
 	private final BotConfig config;
 	private final Random random = new Random();
 
@@ -43,9 +57,19 @@ public class AutoWalkerBot {
 	private Vec3d lastPos = Vec3d.ZERO;
 	private int stuckTicks;
 
+	// Jumping.
+	private int jumpCooldown;
+
 	// Human-like sprint phases.
 	private boolean sprintPhase = true;
 	private int phaseTicks;
+
+	// Smooth low-frequency look drift (replaces per-tick jitter).
+	private float driftYaw;
+	private float driftPitch;
+	private float driftTargetYaw;
+	private float driftTargetPitch;
+	private int driftTicks;
 
 	// Player avoidance.
 	private int avoidTicks;
@@ -70,6 +94,7 @@ public class AutoWalkerBot {
 		pathIndex = 0;
 		stuckTicks = 0;
 		repathCooldown = 0;
+		jumpCooldown = 0;
 	}
 
 	public void stop() {
@@ -108,6 +133,9 @@ public class AutoWalkerBot {
 
 		if (repathCooldown > 0) {
 			repathCooldown--;
+		}
+		if (jumpCooldown > 0) {
+			jumpCooldown--;
 		}
 
 		BlockPos target = currentTarget();
@@ -173,63 +201,106 @@ public class AutoWalkerBot {
 		if (path == null || pathIndex >= path.size()) {
 			return;
 		}
+
 		BlockPos node = path.get(pathIndex);
-		double tx = node.getX() + 0.5;
-		double tz = node.getZ() + 0.5;
-		double dx = tx - player.getX();
-		double dz = tz - player.getZ();
+		double dx = node.getX() + 0.5 - player.getX();
+		double dz = node.getZ() + 0.5 - player.getZ();
 		double horizontal = Math.sqrt(dx * dx + dz * dz);
 
-		if (horizontal < 0.55 && Math.abs(node.getY() - player.getBlockPos().getY()) <= 1) {
+		// Advance to the next node once we are close enough to the current one.
+		if (horizontal < 0.6 && Math.abs(node.getY() - player.getBlockPos().getY()) <= 1) {
 			pathIndex++;
 			if (pathIndex >= path.size()) {
 				releaseMovement(client);
 				return;
 			}
 			node = path.get(pathIndex);
-			tx = node.getX() + 0.5;
-			tz = node.getZ() + 0.5;
-			dx = tx - player.getX();
-			dz = tz - player.getZ();
+			dx = node.getX() + 0.5 - player.getX();
+			dz = node.getZ() + 0.5 - player.getZ();
 			horizontal = Math.sqrt(dx * dx + dz * dz);
 		}
 
-		float targetYaw = (float) (MathHelper.atan2(dz, dx) * 57.2957795) - 90.0F;
-		applyHumanRotation(player, targetYaw);
+		// Aim at a look-ahead point so turning is smooth, not snappy.
+		BlockPos aim = path.get(Math.min(pathIndex + 1, path.size() - 1));
+		double ax = aim.getX() + 0.5 - player.getX();
+		double az = aim.getZ() + 0.5 - player.getZ();
+		double aimHoriz = Math.sqrt(ax * ax + az * az);
+		float desiredYaw = (float) (MathHelper.atan2(az, ax) * 57.2957795) - 90.0F;
 
+		double dyAim = (aim.getY() + 0.5) - player.getEyeY();
+		float desiredPitch = (float) (-Math.toDegrees(MathHelper.atan2(dyAim, Math.max(0.5, aimHoriz))));
+		desiredPitch = MathHelper.clamp(desiredPitch, -20.0F, 25.0F);
+
+		float yawError = Math.abs(MathHelper.wrapDegrees(desiredYaw - player.getYaw()));
+		applyHumanLook(player, desiredYaw, desiredPitch);
+
+		// Walk forward toward the path.
 		setKey(client.options.forwardKey, true);
 		setKey(client.options.backKey, false);
 
-		updateSprint(client, horizontal);
+		updateSprint(client, horizontal, yawError);
 
-		boolean needJump = node.getY() > player.getBlockPos().getY();
-		boolean jump = config.allowJumps && (needJump || isObstacleAhead(client, player));
-		setKey(client.options.jumpKey, jump);
+		boolean onGround = player.isOnGround();
+		boolean needClimb = node.getY() > MathHelper.floor(player.getY());
+		boolean obstacle = isObstacleAhead(client, player);
+		boolean gap = gapAhead(client, player);
+		boolean wantJump = config.allowJumps && onGround && jumpCooldown == 0
+				&& (needClimb || obstacle || gap);
+		setKey(client.options.jumpKey, wantJump);
+		if (wantJump) {
+			jumpCooldown = 8;
+		}
 	}
 
-	private void applyHumanRotation(ClientPlayerEntity player, float targetYaw) {
-		float current = player.getYaw();
-		float delta = MathHelper.wrapDegrees(targetYaw - current);
-		float maxStep = config.humanLike ? 12.0F + random.nextFloat() * 8.0F : 35.0F;
-		delta = MathHelper.clamp(delta, -maxStep, maxStep);
-		float noise = config.humanLike ? (random.nextFloat() - 0.5F) * 2.0F : 0.0F;
-		player.setYaw(current + delta + noise);
-		float pitchNoise = config.humanLike ? (random.nextFloat() - 0.5F) * 1.5F : 0.0F;
-		player.setPitch(MathHelper.clamp(player.getPitch() * 0.9F + pitchNoise, -20.0F, 20.0F));
+	/** Smoothly eases the player's look toward the target with gentle sway. */
+	private void applyHumanLook(ClientPlayerEntity player, float desiredYaw, float desiredPitch) {
+		updateDrift();
+		float targetYaw = desiredYaw + driftYaw;
+		float targetPitch = MathHelper.clamp(desiredPitch + driftPitch, -35.0F, 35.0F);
+		player.setYaw(approachAngle(player.getYaw(), targetYaw, YAW_MAX_STEP));
+		player.setPitch(approachAngle(player.getPitch(), targetPitch, PITCH_MAX_STEP));
 	}
 
-	private void updateSprint(MinecraftClient client, double horizontal) {
+	/** Proportional eased turn: fast when far, slows as it approaches the target. */
+	private float approachAngle(float current, float target, float maxStep) {
+		float delta = MathHelper.wrapDegrees(target - current);
+		float step = delta * TURN_EASE;
+		step = MathHelper.clamp(step, -maxStep, maxStep);
+		return current + step;
+	}
+
+	/** Updates a slow low-frequency sway so the head looks alive but not shaky. */
+	private void updateDrift() {
+		driftTicks--;
+		if (driftTicks <= 0) {
+			if (config.humanLike) {
+				driftTargetYaw = (random.nextFloat() - 0.5F) * 4.0F;
+				driftTargetPitch = (random.nextFloat() - 0.5F) * 3.0F;
+				driftTicks = 25 + random.nextInt(45);
+			} else {
+				driftTargetYaw = 0.0F;
+				driftTargetPitch = 0.0F;
+				driftTicks = 60;
+			}
+		}
+		driftYaw += (driftTargetYaw - driftYaw) * 0.05F;
+		driftPitch += (driftTargetPitch - driftPitch) * 0.05F;
+	}
+
+	private void updateSprint(MinecraftClient client, double horizontal, float yawError) {
 		phaseTicks--;
 		if (phaseTicks <= 0) {
 			if (config.humanLike) {
-				sprintPhase = random.nextFloat() < 0.8F;
-				phaseTicks = 20 + random.nextInt(60);
+				sprintPhase = random.nextFloat() < 0.85F;
+				phaseTicks = 30 + random.nextInt(70);
 			} else {
 				sprintPhase = true;
-				phaseTicks = 100;
+				phaseTicks = 120;
 			}
 		}
-		setKey(client.options.sprintKey, sprintPhase && horizontal > 1.0);
+		// Don't sprint through sharp turns - looks unnatural and overshoots.
+		boolean sprint = sprintPhase && horizontal > 1.2 && yawError < 45.0F;
+		setKey(client.options.sprintKey, sprint);
 	}
 
 	/**
@@ -238,9 +309,30 @@ public class AutoWalkerBot {
 	 */
 	private boolean isObstacleAhead(MinecraftClient client, ClientPlayerEntity player) {
 		Vec3d look = Vec3d.fromPolar(0.0F, player.getYaw());
-		boolean footBlocked = raycastForward(client, player, player.getY() + 0.15, look, 1.2);
-		boolean chestBlocked = raycastForward(client, player, player.getY() + 1.2, look, 1.2);
+		boolean footBlocked = raycastForward(client, player, player.getY() + 0.15, look, 1.0);
+		boolean chestBlocked = raycastForward(client, player, player.getY() + 1.2, look, 1.0);
 		return footBlocked && !chestBlocked;
+	}
+
+	/**
+	 * Detects a small gap ahead: no floor right in front but solid ground a bit
+	 * further, so a jump clears it.
+	 */
+	private boolean gapAhead(MinecraftClient client, ClientPlayerEntity player) {
+		Vec3d look = Vec3d.fromPolar(0.0F, player.getYaw());
+		BlockPos nearDown = BlockPos.ofFloored(
+				player.getX() + look.x * 0.9,
+				player.getY() - 0.3,
+				player.getZ() + look.z * 0.9);
+		BlockPos farDown = BlockPos.ofFloored(
+				player.getX() + look.x * 1.9,
+				player.getY() - 0.3,
+				player.getZ() + look.z * 1.9);
+		boolean noFloorNear = client.world.getBlockState(nearDown)
+				.getCollisionShape(client.world, nearDown).isEmpty();
+		boolean floorFar = !client.world.getBlockState(farDown)
+				.getCollisionShape(client.world, farDown).isEmpty();
+		return noFloorNear && floorFar;
 	}
 
 	/**
@@ -316,8 +408,9 @@ public class AutoWalkerBot {
 		}
 		lastPos = pos;
 
-		if (stuckTicks > 15 && config.allowJumps) {
+		if (stuckTicks > 12 && config.allowJumps && player.isOnGround() && jumpCooldown == 0) {
 			setKey(client.options.jumpKey, true);
+			jumpCooldown = 8;
 		}
 		if (stuckTicks > 40) {
 			path = null;
