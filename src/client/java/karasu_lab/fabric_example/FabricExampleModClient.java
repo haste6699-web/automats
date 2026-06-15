@@ -2,6 +2,7 @@ package karasu_lab.fabric_example;
 
 import karasu_lab.fabric_example.bot.AutoWalkerBot;
 import karasu_lab.fabric_example.bot.BotConfig;
+import karasu_lab.fabric_example.bot.MovementRecorder;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
@@ -35,10 +36,13 @@ public class FabricExampleModClient implements ClientModInitializer {
 	private KeyBinding openConfigKey;
 	private KeyBinding toggleKey;
 	private KeyBinding toggleBotKey;
+	private KeyBinding recordToggleKey;
+	private KeyBinding recordGoalKey;
 
 	// Persistent settings (click speed, points, flags) survive relogs.
 	private final BotConfig config = BotConfig.load();
 	private final AutoWalkerBot bot = new AutoWalkerBot(config);
+	private final MovementRecorder recorder = new MovementRecorder();
 
 	private int clickCooldown;
 
@@ -60,6 +64,18 @@ public class FabricExampleModClient implements ClientModInitializer {
 				"key.gui_auto_clicker.toggle_bot",
 				InputUtil.Type.KEYSYM,
 				GLFW.GLFW_KEY_RIGHT_ALT,
+				KEY_CATEGORY
+		));
+		recordToggleKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+				"key.gui_auto_clicker.record_toggle",
+				InputUtil.Type.KEYSYM,
+				GLFW.GLFW_KEY_RIGHT_BRACKET,
+				KEY_CATEGORY
+		));
+		recordGoalKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+				"key.gui_auto_clicker.record_goal",
+				InputUtil.Type.KEYSYM,
+				GLFW.GLFW_KEY_BACKSLASH,
 				KEY_CATEGORY
 		));
 
@@ -84,8 +100,19 @@ public class FabricExampleModClient implements ClientModInitializer {
 			}
 		}
 
+		while (recordToggleKey.wasPressed()) {
+			recorder.toggle(client);
+		}
+
+		while (recordGoalKey.wasPressed()) {
+			recorder.markGoal(client);
+		}
+
 		// The walker drives movement keys; run it before the auto clicker.
 		bot.tick(client);
+
+		// Record human input (run after the bot so manual play is captured cleanly).
+		recorder.tick(client);
 
 		tickAutoClicker(client);
 	}
