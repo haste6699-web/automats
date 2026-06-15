@@ -119,4 +119,9 @@ def main():
         "l2_b": model.head.bias.detach().cpu().numpy().tolist(),
     }
     with open("model_weights.json", "w", encoding="utf-8") as fh:
-        json.dump(weights,
+        json.dump(weights, fh)
+    print("Exported model_weights.json -> copy it to .minecraft/config/model_weights.json")
+
+
+if __name__ == "__main__":
+    main()
