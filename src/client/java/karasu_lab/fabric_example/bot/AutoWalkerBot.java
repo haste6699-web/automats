@@ -16,14 +16,14 @@ import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.RaycastContext;
 
 import java.util.List;
+import java.util.Locale;
 import java.util.Random;
 
 /**
  * Drives the player from A to B. When a trained policy is available
- * (config/model_weights.json) movement is produced by that model (human-like,
- * learned from the player's own recordings) while A* supplies the look-ahead
- * goal so navigation stays goal-directed. Without a model it falls back to the
- * smooth A* humanizer.
+ * (config/model_weights.json) A* supplies the reliable direction while the model
+ * adds human-like jitter on top. Without a model it falls back to the smooth A*
+ * humanizer.
  */
 public class AutoWalkerBot {
 	private static final float YAW_MAX_STEP = 14.0F;
@@ -44,8 +44,10 @@ public class AutoWalkerBot {
 	private int repathCooldown;
 	private int reloadCooldown;
 
-	private Vec3d lastPos = Vec3d.ZERO;
-	private int stuckTicks;
+	private BlockPos activeTarget;
+	private Vec3d progressAnchor;
+	private int noProgressTicks;
+	private int planAge;
 
 	private int jumpCooldown;
 
@@ -60,6 +62,8 @@ public class AutoWalkerBot {
 
 	private int avoidTicks;
 	private int avoidDir;
+
+	private long debugTick;
 
 	private int lastTriggerCount;
 	private boolean triggerInitialized;
@@ -77,9 +81,13 @@ public class AutoWalkerBot {
 		state = State.TO_B;
 		path = null;
 		pathIndex = 0;
-		stuckTicks = 0;
+		noProgressTicks = 0;
+		progressAnchor = null;
+		planAge = 0;
+		activeTarget = null;
 		repathCooldown = 0;
 		jumpCooldown = 0;
+		BotDebug.reset();
 		boolean model = brain.ensureLoaded();
 		reloadCooldown = 60;
 		MinecraftClient c = MinecraftClient.getInstance();
@@ -139,13 +147,39 @@ public class AutoWalkerBot {
 			stop();
 			return;
 		}
+		activeTarget = target;
 
 		if (player.getBlockPos().isWithinDistance(target, 1.4)) {
 			onReachTarget(client);
 			return;
 		}
 
+		// Re-plan periodically so a partial/stale route gets extended from the
+		// bot's current position as it moves and chunks load.
+		if (++planAge > 60) {
+			path = null;
+			repathCooldown = 0;
+			planAge = 0;
+		}
+
 		if (path == null || pathIndex >= path.size()) {
+			recomputePath(client, target);
+			if (path == null) {
+				BotDebug.log("NO PATH from " + player.getBlockPos().toShortString() + " to " + target.toShortString());
+				releaseMovement(client);
+				return;
+			}
+		}
+
+		// If we are sitting at the end of a best-effort partial route that is not
+		// the real target, force a fresh plan instead of spinning in place.
+		BlockPos last = path.get(path.size() - 1);
+		if (pathIndex >= path.size() - 1
+				&& player.getBlockPos().isWithinDistance(last, 1.8)
+				&& !last.isWithinDistance(target, 1.6)) {
+			BotDebug.log("PARTIAL END at " + last.toShortString() + " -> repath toward " + target.toShortString());
+			path = null;
+			repathCooldown = 0;
 			recomputePath(client, target);
 			if (path == null) {
 				releaseMovement(client);
@@ -166,41 +200,81 @@ public class AutoWalkerBot {
 
 	private void driveWithModel(MinecraftClient client, ClientPlayerEntity player) {
 		advancePathIndex(player);
-		BlockPos goal = lookAheadGoal(player, 8.0);
-		float[] f = BotFeatures.extract(client, player, goal);
+		int idx = Math.min(pathIndex, path.size() - 1);
+		BlockPos node = path.get(idx);
+		BlockPos featureGoal = lookAheadGoal(player, 8.0);
+		float[] f = BotFeatures.extract(client, player, featureGoal);
 		float[] out = brain.infer(f);
 		if (out == null) {
 			followPath(client, player);
 			return;
 		}
 
-		setKey(client.options.forwardKey, out[0] > 0.5F);
-		setKey(client.options.backKey, out[1] > 0.5F);
-		setKey(client.options.sprintKey, out[5] > 0.5F);
+		// Steer toward the next collision-free node. If we are basically on top of
+		// the last (partial) node, steer toward the real target instead so we keep
+		// pushing the right way and never spin on noisy sub-block deltas.
+		BlockPos steerTo = node;
+		double ndx = node.getX() + 0.5 - player.getX();
+		double ndz = node.getZ() + 0.5 - player.getZ();
+		if (ndx * ndx + ndz * ndz < 1.0 && pathIndex >= path.size() - 1 && activeTarget != null) {
+			steerTo = activeTarget;
+		}
 
-		float yawDelta = MathHelper.clamp(out[6], -1.5F, 1.5F) * 15.0F;
-		float pitchDelta = MathHelper.clamp(out[7], -1.5F, 1.5F) * 15.0F;
-		player.setYaw(player.getYaw() + yawDelta);
-		player.setPitch(MathHelper.clamp(player.getPitch() + pitchDelta, -90.0F, 90.0F));
+		// A* gives the reliable direction; the model adds human-like jitter on top.
+		double dx = steerTo.getX() + 0.5 - player.getX();
+		double dz = steerTo.getZ() + 0.5 - player.getZ();
+		double horizontal = Math.sqrt(dx * dx + dz * dz);
+		float desiredYaw = (float) (MathHelper.atan2(dz, dx) * 57.2957795) - 90.0F;
+		float yawError = MathHelper.wrapDegrees(desiredYaw - player.getYaw());
 
+		updateDrift();
+		float modelYawJitter = MathHelper.clamp(out[6], -1.0F, 1.0F) * 6.0F;
+		float targetYaw = desiredYaw + driftYaw + modelYawJitter * 0.25F;
+		player.setYaw(MathHelper.wrapDegrees(approachAngle(player.getYaw(), targetYaw, YAW_MAX_STEP)));
+
+		double dyNode = (node.getY() + 0.5) - player.getEyeY();
+		float desiredPitch = MathHelper.clamp(
+				(float) (-Math.toDegrees(MathHelper.atan2(dyNode, Math.max(0.5, horizontal)))),
+				-20.0F, 25.0F);
+		float modelPitchJitter = MathHelper.clamp(out[7], -1.0F, 1.0F) * 4.0F;
+		float targetPitch = MathHelper.clamp(desiredPitch + driftPitch + modelPitchJitter * 0.25F, -35.0F, 35.0F);
+		player.setPitch(approachAngle(player.getPitch(), targetPitch, PITCH_MAX_STEP));
+
+		boolean facing = Math.abs(yawError) < 55.0F;
+
+		// Only walk forward when roughly facing the next node, so it never grinds
+		// straight into a wall it is not aligned with.
+		setKey(client.options.forwardKey, facing);
+		setKey(client.options.backKey, false);
+
+		boolean sprint = facing && horizontal > 1.2 && Math.abs(yawError) < 30.0F && out[5] > 0.4F;
+		setKey(client.options.sprintKey, sprint);
+
+		boolean onGround = player.isOnGround();
+		boolean needClimb = node.getY() > MathHelper.floor(player.getY());
 		boolean foot = f[6] > 0.5F;
 		boolean chest = f[7] > 0.5F;
 		boolean gap = f[8] > 0.5F;
-		boolean geomJump = (foot && !chest) || gap;
-		boolean wantJump = config.allowJumps && player.isOnGround() && jumpCooldown == 0
-				&& (out[4] > 0.5F || geomJump);
+		boolean geomJump = needClimb || (foot && !chest) || gap;
+		boolean wantJump = config.allowJumps && facing && onGround && jumpCooldown == 0 && geomJump;
 		setKey(client.options.jumpKey, wantJump);
 		if (wantJump) {
-			jumpCooldown = 8;
+			jumpCooldown = 10;
 		}
 
 		int ad = updateAvoid(client, player);
-		if (ad != 0) {
-			setKey(client.options.leftKey, ad < 0);
-			setKey(client.options.rightKey, ad > 0);
-		} else {
-			setKey(client.options.leftKey, out[2] > 0.5F);
-			setKey(client.options.rightKey, out[3] > 0.5F);
+		setKey(client.options.leftKey, ad < 0);
+		setKey(client.options.rightKey, ad > 0);
+
+		if (debugTick++ % 3 == 0) {
+			BotDebug.log(String.format(Locale.ROOT,
+					"t=%d pos=%.1f,%.1f,%.1f yaw=%.1f want=%.1f err=%.1f path=%d/%d node=%d,%d,%d dist=%.2f ground=%b face=%b | F=%b S=%b J=%b L=%b R=%b | f=[%s] out=[%s]",
+					debugTick, player.getX(), player.getY(), player.getZ(),
+					player.getYaw(), desiredYaw, yawError,
+					pathIndex, path.size(), node.getX(), node.getY(), node.getZ(),
+					horizontal, onGround, facing,
+					facing, sprint, wantJump, ad < 0, ad > 0,
+					fmt(f), fmt(out)));
 		}
 	}
 
@@ -240,6 +314,8 @@ public class AutoWalkerBot {
 		releaseMovement(client);
 		path = null;
 		pathIndex = 0;
+		progressAnchor = null;
+		noProgressTicks = 0;
 		if (state == State.TO_B) {
 			state = State.TO_A;
 		} else {
@@ -258,6 +334,7 @@ public class AutoWalkerBot {
 		path = finder.findPath(client.player.getBlockPos(), target, config.allowJumps);
 		pathIndex = 0;
 		repathCooldown = 20;
+		planAge = 0;
 		if (path != null && path.size() > 1) {
 			pathIndex = 1;
 		}
@@ -319,7 +396,7 @@ public class AutoWalkerBot {
 		updateDrift();
 		float targetYaw = desiredYaw + driftYaw;
 		float targetPitch = MathHelper.clamp(desiredPitch + driftPitch, -35.0F, 35.0F);
-		player.setYaw(approachAngle(player.getYaw(), targetYaw, YAW_MAX_STEP));
+		player.setYaw(MathHelper.wrapDegrees(approachAngle(player.getYaw(), targetYaw, YAW_MAX_STEP)));
 		player.setPitch(approachAngle(player.getPitch(), targetPitch, PITCH_MAX_STEP));
 	}
 
@@ -436,21 +513,30 @@ public class AutoWalkerBot {
 
 	private void updateStuck(MinecraftClient client, ClientPlayerEntity player) {
 		Vec3d pos = player.getPos();
-		if (pos.squaredDistanceTo(lastPos) < 0.0009) {
-			stuckTicks++;
+		if (progressAnchor == null) {
+			progressAnchor = pos;
+			noProgressTicks = 0;
+			return;
+		}
+		// Reset only when we have actually travelled more than ~1.5 blocks; tiny
+		// jitter from turning in place does not count as progress.
+		if (pos.squaredDistanceTo(progressAnchor) > 2.25) {
+			progressAnchor = pos;
+			noProgressTicks = 0;
 		} else {
-			stuckTicks = 0;
+			noProgressTicks++;
 		}
-		lastPos = pos;
 
-		if (stuckTicks > 12 && config.allowJumps && player.isOnGround() && jumpCooldown == 0) {
+		if (noProgressTicks == 25 && config.allowJumps && player.isOnGround() && jumpCooldown == 0) {
 			setKey(client.options.jumpKey, true);
-			jumpCooldown = 8;
+			jumpCooldown = 10;
 		}
-		if (stuckTicks > 40) {
+		if (noProgressTicks > 45) {
+			BotDebug.log("STUCK no-progress -> repath at " + player.getBlockPos().toShortString());
 			path = null;
 			repathCooldown = 0;
-			stuckTicks = 0;
+			noProgressTicks = 0;
+			progressAnchor = pos;
 		}
 	}
 
@@ -470,6 +556,17 @@ public class AutoWalkerBot {
 		if (key != null) {
 			key.setPressed(pressed);
 		}
+	}
+
+	private static String fmt(float[] a) {
+		StringBuilder sb = new StringBuilder();
+		for (int i = 0; i < a.length; i++) {
+			if (i > 0) {
+				sb.append(',');
+			}
+			sb.append(String.format(Locale.ROOT, "%.2f", a[i]));
+		}
+		return sb.toString();
 	}
 
 	private int countTriggerItems(ClientPlayerEntity player) {
