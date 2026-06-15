@@ -1,6 +1,11 @@
 package karasu_lab.fabric_example.bot;
 
+import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
+import net.minecraft.block.DoorBlock;
+import net.minecraft.block.FenceGateBlock;
+import net.minecraft.block.TrapdoorBlock;
+import net.minecraft.state.property.Properties;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.world.BlockView;
 
@@ -20,6 +25,10 @@ import java.util.Set;
  * WITHOUT breaking or placing blocks: walking, diagonals, single-block jumps,
  * short falls and parkour jumps across 1-3 wide gaps. Diagonal moves require
  * both corner columns to be free so the bot never clips through block edges.
+ *
+ * <p>Open trapdoors, doors and fence gates are treated as walk-through space
+ * (their thin collision box would otherwise wall off decorative passages such
+ * as open iron trapdoors lining a staircase). Closed ones stay solid.
  *
  * <p>It returns the best partial route when the goal cannot be reached within
  * the node budget, so the caller can walk forward and re-plan from a closer
@@ -203,7 +212,20 @@ public final class Pathfinder {
 
 	private boolean isPassable(BlockPos pos) {
 		BlockState state = world.getBlockState(pos);
+		// Open trapdoors / doors / fence gates are decorative pass-throughs: their
+		// thin collision box would otherwise be read as a solid wall.
+		if (isWalkThroughOpenable(state)) {
+			return true;
+		}
 		return state.getCollisionShape(world, pos).isEmpty();
+	}
+
+	private boolean isWalkThroughOpenable(BlockState state) {
+		Block block = state.getBlock();
+		boolean openable = block instanceof TrapdoorBlock
+				|| block instanceof DoorBlock
+				|| block instanceof FenceGateBlock;
+		return openable && state.contains(Properties.OPEN) && state.get(Properties.OPEN);
 	}
 
 	private BlockPos adjustToGround(BlockPos pos) {
