@@ -30,6 +30,9 @@ import java.util.Set;
  * (their thin collision box would otherwise wall off decorative passages such
  * as open iron trapdoors lining a staircase). Closed ones stay solid.
  *
+ * <p>A small wall-hug penalty biases the route toward the middle of corridors
+ * and open space instead of scraping along walls.
+ *
  * <p>It returns the best partial route when the goal cannot be reached within
  * the node budget, so the caller can walk forward and re-plan from a closer
  * position (segmented planning).
@@ -38,6 +41,7 @@ public final class Pathfinder {
 	private static final int MAX_NODES = 40000;
 	private static final int MAX_FALL = 3;
 	private static final int MAX_PARKOUR = 4;
+	private static final double WALL_PENALTY = 0.2;
 	private static final int[][] DIRS = {
 			{1, 0}, {-1, 0}, {0, 1}, {0, -1},
 			{1, 1}, {1, -1}, {-1, 1}, {-1, -1}
@@ -115,7 +119,7 @@ public final class Pathfinder {
 			// 1. Walk on the same level.
 			BlockPos flat = from.add(dx, 0, dz);
 			if (canStandAt(flat) && (!diagonal || cornersClear(from, dx, dz, 0))) {
-				moves.add(new Move(flat, base));
+				moves.add(new Move(flat, base + wallPenalty(flat)));
 				continue;
 			}
 
@@ -123,7 +127,7 @@ public final class Pathfinder {
 			if (allowJumps) {
 				BlockPos up = from.add(dx, 1, dz);
 				if (isPassable(from.up(2)) && canStandAt(up) && (!diagonal || cornersClear(from, dx, dz, 1))) {
-					moves.add(new Move(up, base + 0.8));
+					moves.add(new Move(up, base + 0.8 + wallPenalty(up)));
 					continue;
 				}
 			}
@@ -134,7 +138,7 @@ public final class Pathfinder {
 				for (int d = 1; d <= MAX_FALL; d++) {
 					BlockPos down = from.add(dx, -d, dz);
 					if (canStandAt(down)) {
-						moves.add(new Move(down, base + 0.2 * d));
+						moves.add(new Move(down, base + 0.2 * d + wallPenalty(down)));
 						landed = true;
 						break;
 					}
@@ -184,11 +188,11 @@ public final class Pathfinder {
 			}
 			BlockPos landSame = from.add(dx * len, 0, dz * len);
 			if (canStandAt(landSame)) {
-				return new Move(landSame, base(len) + 1.5);
+				return new Move(landSame, base(len) + 1.5 + wallPenalty(landSame));
 			}
 			BlockPos landDown = from.add(dx * len, -1, dz * len);
 			if (canStandAt(landDown)) {
-				return new Move(landDown, base(len) + 1.7);
+				return new Move(landDown, base(len) + 1.7 + wallPenalty(landDown));
 			}
 		}
 		return null;
@@ -208,6 +212,25 @@ public final class Pathfinder {
 
 	private boolean isColumnPassable(BlockPos feet) {
 		return isPassable(feet) && isPassable(feet.up());
+	}
+
+	// Small cost for standing right next to walls so equal-length routes prefer
+	// the middle of a corridor instead of scraping along one side.
+	private double wallPenalty(BlockPos feet) {
+		int walls = 0;
+		if (!isPassable(feet.add(1, 0, 0))) {
+			walls++;
+		}
+		if (!isPassable(feet.add(-1, 0, 0))) {
+			walls++;
+		}
+		if (!isPassable(feet.add(0, 0, 1))) {
+			walls++;
+		}
+		if (!isPassable(feet.add(0, 0, -1))) {
+			walls++;
+		}
+		return walls * WALL_PENALTY;
 	}
 
 	private boolean isPassable(BlockPos pos) {

@@ -149,7 +149,7 @@ public class AutoWalkerBot {
 		}
 		activeTarget = target;
 
-		if (player.getBlockPos().isWithinDistance(target, 1.4)) {
+		if (reachedTarget(player, target)) {
 			onReachTarget(client);
 			return;
 		}
@@ -196,6 +196,17 @@ public class AutoWalkerBot {
 			setKey(client.options.rightKey, ad > 0);
 		}
 		updateStuck(client, player);
+	}
+
+	// Count as arrived using horizontal distance plus a loose vertical tolerance.
+	// Near the goal the bot is often mid-hop (one block higher), and a strict 3D
+	// radius would just miss it and leave it stuck one block short of the target.
+	private boolean reachedTarget(ClientPlayerEntity player, BlockPos target) {
+		double dx = (target.getX() + 0.5) - player.getX();
+		double dz = (target.getZ() + 0.5) - player.getZ();
+		double horizontal = Math.sqrt(dx * dx + dz * dz);
+		int dy = Math.abs(target.getY() - player.getBlockPos().getY());
+		return horizontal <= 1.4 && dy <= 1;
 	}
 
 	private void driveWithModel(MinecraftClient client, ClientPlayerEntity player) {
@@ -264,18 +275,19 @@ public class AutoWalkerBot {
 
 		// Obstacle / climb / gap jumps.
 		boolean geomJump = needClimb || (foot && !chest) || gap;
-		// Human-style sprint-jumping: hop along open, straight, level stretches to
-		// keep momentum (a sprint-jump covers ground faster than plain sprinting).
+		// Human-style sprint-jumping: hop only along open, straight, level stretches
+		// (not in tight corridors with a wall at our side, where hopping just makes
+		// us scrape and bump). Spaced out so it looks natural, not like a pogo.
 		boolean levelAhead = node.getY() <= MathHelper.floor(player.getY());
 		boolean sprintJump = config.allowJumps && sprint && onGround && !geomJump
-				&& !sharpTurn && !chest && levelAhead
-				&& Math.abs(yawError) < 14.0F && horizontal > 2.0
+				&& !sharpTurn && !tight && !chest && levelAhead
+				&& Math.abs(yawError) < 12.0F && horizontal > 2.5
 				&& headClear(client, player);
 		boolean wantJump = config.allowJumps && facing && onGround && jumpCooldown == 0
 				&& (geomJump || sprintJump);
 		setKey(client.options.jumpKey, wantJump);
 		if (wantJump) {
-			jumpCooldown = geomJump ? 10 : 11 + random.nextInt(3);
+			jumpCooldown = geomJump ? 10 : 18 + random.nextInt(12);
 		}
 
 		int ad = updateAvoid(client, player);
