@@ -210,13 +210,12 @@ public class AutoWalkerBot {
 			return;
 		}
 
-		// Steer toward the next collision-free node. If we are basically on top of
-		// the last (partial) node, steer toward the real target instead so we keep
-		// pushing the right way and never spin on noisy sub-block deltas.
+		// Steer toward the next collision-free node. Once we are on the final node
+		// of the route, steer straight at the real target so we always close the
+		// last block or two even when A* could only path *near* the goal (otherwise
+		// the bot stalls a couple blocks short, e.g. at 290,67,582 instead of 584).
 		BlockPos steerTo = node;
-		double ndx = node.getX() + 0.5 - player.getX();
-		double ndz = node.getZ() + 0.5 - player.getZ();
-		if (ndx * ndx + ndz * ndz < 1.0 && pathIndex >= path.size() - 1 && activeTarget != null) {
+		if (pathIndex >= path.size() - 1 && activeTarget != null) {
 			steerTo = activeTarget;
 		}
 
@@ -247,19 +246,36 @@ public class AutoWalkerBot {
 		setKey(client.options.forwardKey, facing);
 		setKey(client.options.backKey, false);
 
-		boolean sprint = facing && horizontal > 1.2 && Math.abs(yawError) < 30.0F && out[5] > 0.4F;
-		setKey(client.options.sprintKey, sprint);
+		// Look at the turn coming after this node so we can ease off the throttle
+		// and stop clipping the corner instead of barrelling into the wall.
+		float turnAhead = upcomingTurn(idx, desiredYaw);
+		boolean sharpTurn = turnAhead > 45.0F && horizontal < 3.0;
+		boolean tight = f[9] > 0.5F || f[10] > 0.5F;
 
 		boolean onGround = player.isOnGround();
 		boolean needClimb = node.getY() > MathHelper.floor(player.getY());
 		boolean foot = f[6] > 0.5F;
 		boolean chest = f[7] > 0.5F;
 		boolean gap = f[8] > 0.5F;
+
+		boolean sprint = facing && !sharpTurn && !(tight && turnAhead > 20.0F)
+				&& horizontal > 1.2 && Math.abs(yawError) < 30.0F && out[5] > 0.4F;
+		setKey(client.options.sprintKey, sprint);
+
+		// Obstacle / climb / gap jumps.
 		boolean geomJump = needClimb || (foot && !chest) || gap;
-		boolean wantJump = config.allowJumps && facing && onGround && jumpCooldown == 0 && geomJump;
+		// Human-style sprint-jumping: hop along open, straight, level stretches to
+		// keep momentum (a sprint-jump covers ground faster than plain sprinting).
+		boolean levelAhead = node.getY() <= MathHelper.floor(player.getY());
+		boolean sprintJump = config.allowJumps && sprint && onGround && !geomJump
+				&& !sharpTurn && !chest && levelAhead
+				&& Math.abs(yawError) < 14.0F && horizontal > 2.0
+				&& headClear(client, player);
+		boolean wantJump = config.allowJumps && facing && onGround && jumpCooldown == 0
+				&& (geomJump || sprintJump);
 		setKey(client.options.jumpKey, wantJump);
 		if (wantJump) {
-			jumpCooldown = 10;
+			jumpCooldown = geomJump ? 10 : 11 + random.nextInt(3);
 		}
 
 		int ad = updateAvoid(client, player);
@@ -283,6 +299,26 @@ public class AutoWalkerBot {
 				&& player.getBlockPos().isWithinDistance(path.get(pathIndex), 1.6)) {
 			pathIndex++;
 		}
+	}
+
+	private float upcomingTurn(int idx, float desiredYaw) {
+		if (path == null || idx + 1 >= path.size()) {
+			return 0.0F;
+		}
+		BlockPos a = path.get(idx);
+		BlockPos b = path.get(idx + 1);
+		double nx = b.getX() - a.getX();
+		double nz = b.getZ() - a.getZ();
+		if (nx * nx + nz * nz < 0.01) {
+			return 0.0F;
+		}
+		float nextYaw = (float) (MathHelper.atan2(nz, nx) * 57.2957795) - 90.0F;
+		return Math.abs(MathHelper.wrapDegrees(nextYaw - desiredYaw));
+	}
+
+	private boolean headClear(MinecraftClient client, ClientPlayerEntity player) {
+		BlockPos head = BlockPos.ofFloored(player.getX(), player.getEyeY() + 1.3, player.getZ());
+		return client.world.getBlockState(head).getCollisionShape(client.world, head).isEmpty();
 	}
 
 	private BlockPos lookAheadGoal(ClientPlayerEntity player, double aheadBlocks) {
