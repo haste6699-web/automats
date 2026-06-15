@@ -19,13 +19,11 @@ import java.util.List;
 import java.util.Random;
 
 /**
- * Drives the player from point A to point B (and back, cyclically) using the
- * {@link Pathfinder} for look-ahead routing. Movement uses the vanilla key
- * bindings so it behaves like genuine input.
- *
- * <p>NOTE: the cargo-head auto-start trigger is temporarily disabled while the
- * movement model is being trained. The bot only walks when started manually
- * (toggle key). The {@link MovementRecorder} remains active for dataset capture.
+ * Drives the player from A to B. When a trained policy is available
+ * (config/model_weights.json) movement is produced by that model (human-like,
+ * learned from the player's own recordings) while A* supplies the look-ahead
+ * goal so navigation stays goal-directed. Without a model it falls back to the
+ * smooth A* humanizer.
  */
 public class AutoWalkerBot {
 	private static final float YAW_MAX_STEP = 14.0F;
@@ -33,6 +31,7 @@ public class AutoWalkerBot {
 	private static final float TURN_EASE = 0.35F;
 
 	private final BotConfig config;
+	private final BotBrain brain = new BotBrain();
 	private final Random random = new Random();
 
 	private enum State { IDLE, TO_A, TO_B }
@@ -43,28 +42,27 @@ public class AutoWalkerBot {
 	private List<BlockPos> path;
 	private int pathIndex;
 	private int repathCooldown;
+	private int reloadCooldown;
 
-	// Stuck detection.
 	private Vec3d lastPos = Vec3d.ZERO;
 	private int stuckTicks;
 
-	// Jumping.
 	private int jumpCooldown;
 
-	// Human-like sprint phases.
 	private boolean sprintPhase = true;
 	private int phaseTicks;
 
-	// Smooth low-frequency look drift (replaces per-tick jitter).
 	private float driftYaw;
 	private float driftPitch;
 	private float driftTargetYaw;
 	private float driftTargetPitch;
 	private int driftTicks;
 
-	// Player avoidance.
 	private int avoidTicks;
-	private int avoidDir; // -1 = strafe left, +1 = strafe right
+	private int avoidDir;
+
+	private int lastTriggerCount;
+	private boolean triggerInitialized;
 
 	public AutoWalkerBot(BotConfig config) {
 		this.config = config;
@@ -82,6 +80,14 @@ public class AutoWalkerBot {
 		stuckTicks = 0;
 		repathCooldown = 0;
 		jumpCooldown = 0;
+		boolean model = brain.ensureLoaded();
+		reloadCooldown = 60;
+		MinecraftClient c = MinecraftClient.getInstance();
+		if (c != null && c.player != null) {
+			c.player.sendMessage(Text.literal(model
+					? "\u00a7aWalker: trained model active"
+					: "\u00a7eWalker: no model found, using A* fallback"), true);
+		}
 	}
 
 	public void stop() {
@@ -97,14 +103,21 @@ public class AutoWalkerBot {
 			return;
 		}
 
-		// Cargo-head auto-start trigger is temporarily disabled while the model
-		// is being trained. Re-enable once movement is driven by the trained model.
+		if (config.startOnTrigger) {
+			int count = countTriggerItems(player);
+			if (!triggerInitialized) {
+				lastTriggerCount = count;
+				triggerInitialized = true;
+			} else if (count > lastTriggerCount && !running) {
+				start();
+			}
+			lastTriggerCount = count;
+		}
 
 		if (!running) {
 			return;
 		}
 
-		// Don't try to walk while a screen (chat, inventory, container) is open.
 		if (client.currentScreen != null) {
 			releaseMovement(client);
 			return;
@@ -115,6 +128,10 @@ public class AutoWalkerBot {
 		}
 		if (jumpCooldown > 0) {
 			jumpCooldown--;
+		}
+		if (--reloadCooldown <= 0) {
+			brain.ensureLoaded();
+			reloadCooldown = 60;
 		}
 
 		BlockPos target = currentTarget();
@@ -136,9 +153,79 @@ public class AutoWalkerBot {
 			}
 		}
 
-		followPath(client, player);
-		handlePlayerAvoidance(client, player);
+		if (brain.isReady()) {
+			driveWithModel(client, player);
+		} else {
+			followPath(client, player);
+			int ad = updateAvoid(client, player);
+			setKey(client.options.leftKey, ad < 0);
+			setKey(client.options.rightKey, ad > 0);
+		}
 		updateStuck(client, player);
+	}
+
+	private void driveWithModel(MinecraftClient client, ClientPlayerEntity player) {
+		advancePathIndex(player);
+		BlockPos goal = lookAheadGoal(player, 8.0);
+		float[] f = BotFeatures.extract(client, player, goal);
+		float[] out = brain.infer(f);
+		if (out == null) {
+			followPath(client, player);
+			return;
+		}
+
+		setKey(client.options.forwardKey, out[0] > 0.5F);
+		setKey(client.options.backKey, out[1] > 0.5F);
+		setKey(client.options.sprintKey, out[5] > 0.5F);
+
+		float yawDelta = MathHelper.clamp(out[6], -1.5F, 1.5F) * 15.0F;
+		float pitchDelta = MathHelper.clamp(out[7], -1.5F, 1.5F) * 15.0F;
+		player.setYaw(player.getYaw() + yawDelta);
+		player.setPitch(MathHelper.clamp(player.getPitch() + pitchDelta, -90.0F, 90.0F));
+
+		boolean foot = f[6] > 0.5F;
+		boolean chest = f[7] > 0.5F;
+		boolean gap = f[8] > 0.5F;
+		boolean geomJump = (foot && !chest) || gap;
+		boolean wantJump = config.allowJumps && player.isOnGround() && jumpCooldown == 0
+				&& (out[4] > 0.5F || geomJump);
+		setKey(client.options.jumpKey, wantJump);
+		if (wantJump) {
+			jumpCooldown = 8;
+		}
+
+		int ad = updateAvoid(client, player);
+		if (ad != 0) {
+			setKey(client.options.leftKey, ad < 0);
+			setKey(client.options.rightKey, ad > 0);
+		} else {
+			setKey(client.options.leftKey, out[2] > 0.5F);
+			setKey(client.options.rightKey, out[3] > 0.5F);
+		}
+	}
+
+	private void advancePathIndex(ClientPlayerEntity player) {
+		while (pathIndex < path.size() - 1
+				&& player.getBlockPos().isWithinDistance(path.get(pathIndex), 1.6)) {
+			pathIndex++;
+		}
+	}
+
+	private BlockPos lookAheadGoal(ClientPlayerEntity player, double aheadBlocks) {
+		if (path == null || path.isEmpty()) {
+			return player.getBlockPos();
+		}
+		double acc = 0.0;
+		BlockPos prev = player.getBlockPos();
+		for (int i = Math.min(pathIndex, path.size() - 1); i < path.size(); i++) {
+			BlockPos n = path.get(i);
+			acc += Math.sqrt(prev.getSquaredDistance(n));
+			prev = n;
+			if (acc >= aheadBlocks) {
+				return n;
+			}
+		}
+		return path.get(path.size() - 1);
 	}
 
 	private BlockPos currentTarget() {
@@ -172,7 +259,7 @@ public class AutoWalkerBot {
 		pathIndex = 0;
 		repathCooldown = 20;
 		if (path != null && path.size() > 1) {
-			pathIndex = 1; // skip the node we are already standing on
+			pathIndex = 1;
 		}
 	}
 
@@ -186,7 +273,6 @@ public class AutoWalkerBot {
 		double dz = node.getZ() + 0.5 - player.getZ();
 		double horizontal = Math.sqrt(dx * dx + dz * dz);
 
-		// Advance to the next node once we are close enough to the current one.
 		if (horizontal < 0.6 && Math.abs(node.getY() - player.getBlockPos().getY()) <= 1) {
 			pathIndex++;
 			if (pathIndex >= path.size()) {
@@ -199,7 +285,6 @@ public class AutoWalkerBot {
 			horizontal = Math.sqrt(dx * dx + dz * dz);
 		}
 
-		// Aim at a look-ahead point so turning is smooth, not snappy.
 		BlockPos aim = path.get(Math.min(pathIndex + 1, path.size() - 1));
 		double ax = aim.getX() + 0.5 - player.getX();
 		double az = aim.getZ() + 0.5 - player.getZ();
@@ -213,7 +298,6 @@ public class AutoWalkerBot {
 		float yawError = Math.abs(MathHelper.wrapDegrees(desiredYaw - player.getYaw()));
 		applyHumanLook(player, desiredYaw, desiredPitch);
 
-		// Walk forward toward the path.
 		setKey(client.options.forwardKey, true);
 		setKey(client.options.backKey, false);
 
@@ -231,7 +315,6 @@ public class AutoWalkerBot {
 		}
 	}
 
-	/** Smoothly eases the player's look toward the target with gentle sway. */
 	private void applyHumanLook(ClientPlayerEntity player, float desiredYaw, float desiredPitch) {
 		updateDrift();
 		float targetYaw = desiredYaw + driftYaw;
@@ -240,7 +323,6 @@ public class AutoWalkerBot {
 		player.setPitch(approachAngle(player.getPitch(), targetPitch, PITCH_MAX_STEP));
 	}
 
-	/** Proportional eased turn: fast when far, slows as it approaches the target. */
 	private float approachAngle(float current, float target, float maxStep) {
 		float delta = MathHelper.wrapDegrees(target - current);
 		float step = delta * TURN_EASE;
@@ -248,7 +330,6 @@ public class AutoWalkerBot {
 		return current + step;
 	}
 
-	/** Updates a slow low-frequency sway so the head looks alive but not shaky. */
 	private void updateDrift() {
 		driftTicks--;
 		if (driftTicks <= 0) {
@@ -277,15 +358,10 @@ public class AutoWalkerBot {
 				phaseTicks = 120;
 			}
 		}
-		// Don't sprint through sharp turns - looks unnatural and overshoots.
 		boolean sprint = sprintPhase && horizontal > 1.2 && yawError < 45.0F;
 		setKey(client.options.sprintKey, sprint);
 	}
 
-	/**
-	 * Real voxel raycast: detects a block directly ahead at foot level while the
-	 * chest level is clear -> a jumpable obstacle.
-	 */
 	private boolean isObstacleAhead(MinecraftClient client, ClientPlayerEntity player) {
 		Vec3d look = Vec3d.fromPolar(0.0F, player.getYaw());
 		boolean footBlocked = raycastForward(client, player, player.getY() + 0.15, look, 1.0);
@@ -293,10 +369,6 @@ public class AutoWalkerBot {
 		return footBlocked && !chestBlocked;
 	}
 
-	/**
-	 * Detects a small gap ahead: no floor right in front but solid ground a bit
-	 * further, so a jump clears it.
-	 */
 	private boolean gapAhead(MinecraftClient client, ClientPlayerEntity player) {
 		Vec3d look = Vec3d.fromPolar(0.0F, player.getYaw());
 		BlockPos nearDown = BlockPos.ofFloored(
@@ -314,10 +386,6 @@ public class AutoWalkerBot {
 		return noFloorNear && floorFar;
 	}
 
-	/**
-	 * Casts a horizontal ray from the player at the given Y and reports whether
-	 * it hits a solid (collider) block within {@code dist} blocks.
-	 */
 	private boolean raycastForward(MinecraftClient client, ClientPlayerEntity player, double y, Vec3d look, double dist) {
 		Vec3d start = new Vec3d(player.getX(), y, player.getZ());
 		Vec3d end = start.add(look.x * dist, 0.0, look.z * dist);
@@ -330,24 +398,14 @@ public class AutoWalkerBot {
 		return hit != null && hit.getType() == HitResult.Type.BLOCK;
 	}
 
-	private void handlePlayerAvoidance(MinecraftClient client, ClientPlayerEntity player) {
+	private int updateAvoid(MinecraftClient client, ClientPlayerEntity player) {
 		if (!config.avoidPlayers) {
-			setKey(client.options.leftKey, false);
-			setKey(client.options.rightKey, false);
-			return;
+			return 0;
 		}
-
 		if (avoidTicks > 0) {
 			avoidTicks--;
-			setKey(client.options.leftKey, avoidDir < 0);
-			setKey(client.options.rightKey, avoidDir > 0);
-			if (avoidTicks == 0) {
-				setKey(client.options.leftKey, false);
-				setKey(client.options.rightKey, false);
-			}
-			return;
+			return avoidDir;
 		}
-
 		AbstractClientPlayerEntity nearest = null;
 		double nearestDist = Double.MAX_VALUE;
 		for (AbstractClientPlayerEntity other : client.world.getPlayers()) {
@@ -360,27 +418,25 @@ public class AutoWalkerBot {
 				nearest = other;
 			}
 		}
-
-		if (nearest != null && nearestDist < 6.25) { // within ~2.5 blocks
+		if (nearest != null && nearestDist < 6.25) {
 			Vec3d toOther = nearest.getPos().subtract(player.getPos());
 			Vec3d look = Vec3d.fromPolar(0.0F, player.getYaw());
 			if (toOther.lengthSquared() > 1.0E-4) {
 				double dot = toOther.normalize().dotProduct(look.normalize());
-				if (dot > 0.3) { // roughly in front of us
+				if (dot > 0.3) {
 					double cross = look.x * toOther.z - look.z * toOther.x;
 					avoidDir = cross > 0 ? -1 : 1;
 					avoidTicks = 8 + random.nextInt(8);
-					return;
+					return avoidDir;
 				}
 			}
 		}
-		setKey(client.options.leftKey, false);
-		setKey(client.options.rightKey, false);
+		return 0;
 	}
 
 	private void updateStuck(MinecraftClient client, ClientPlayerEntity player) {
 		Vec3d pos = player.getPos();
-		if (pos.squaredDistanceTo(lastPos) < 0.0009) { // moved < 0.03 block
+		if (pos.squaredDistanceTo(lastPos) < 0.0009) {
 			stuckTicks++;
 		} else {
 			stuckTicks = 0;
@@ -414,5 +470,28 @@ public class AutoWalkerBot {
 		if (key != null) {
 			key.setPressed(pressed);
 		}
+	}
+
+	private int countTriggerItems(ClientPlayerEntity player) {
+		int count = 0;
+		for (ItemStack stack : player.getInventory().main) {
+			if (isTriggerStack(stack)) {
+				count += stack.getCount();
+			}
+		}
+		for (ItemStack stack : player.getInventory().offHand) {
+			if (isTriggerStack(stack)) {
+				count += stack.getCount();
+			}
+		}
+		return count;
+	}
+
+	private boolean isTriggerStack(ItemStack stack) {
+		if (stack == null || stack.isEmpty() || !stack.isOf(Items.PLAYER_HEAD)) {
+			return false;
+		}
+		Text name = stack.get(DataComponentTypes.CUSTOM_NAME);
+		return name != null && name.getString().contains("\u0413\u0440\u0443\u0437");
 	}
 }

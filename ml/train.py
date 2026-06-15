@@ -1,16 +1,15 @@
-"""Train a small behavioral-cloning policy on recorded Minecraft movement and
-export it to ONNX so the mod can run it in-game (no Python at runtime).
+"""Train a small behavioral-cloning policy on recorded Minecraft movement.
 
 Usage:
     pip install torch numpy
-    python train.py path/to/bot_dataset.jsonl
+    python train.py [path/to/bot_dataset.jsonl]
 
 The dataset is produced by the in-game MovementRecorder. Each line is:
     {"f": [12 features], "a": [fwd, back, left, right, jump, sprint, yawDelta, pitchDelta]}
 
-Output: model.onnx  (input "input" [batch,12], output "actions" [batch,8];
-the first 6 outputs are key probabilities in 0..1, the last 2 are yaw/pitch
-deltas scaled by 15 degrees, matching BotFeatures / MovementRecorder).
+Output: model_weights.json -- plain JSON weights for the pure-Java inference in
+the mod (no ONNX / no native runtime needed). Copy it to:
+    .minecraft/config/model_weights.json
 """
 import glob
 import json
@@ -111,14 +110,13 @@ def main():
             print(f"epoch {ep + 1}/{epochs}  loss {total / n:.4f}")
 
     model.eval()
-    dummy = torch.zeros(1, NUM_FEATURES)
-    torch.onnx.export(
-        model, dummy, "model.onnx",
-        input_names=["input"], output_names=["actions"],
-        dynamic_axes={"input": {0: "batch"}, "actions": {0: "batch"}},
-        opset_version=11)
-    print("Exported model.onnx -> put it in .minecraft/config/bot_model.onnx")
-
-
-if __name__ == "__main__":
-    main()
+    weights = {
+        "l0_w": model.backbone[0].weight.detach().cpu().numpy().tolist(),
+        "l0_b": model.backbone[0].bias.detach().cpu().numpy().tolist(),
+        "l1_w": model.backbone[2].weight.detach().cpu().numpy().tolist(),
+        "l1_b": model.backbone[2].bias.detach().cpu().numpy().tolist(),
+        "l2_w": model.head.weight.detach().cpu().numpy().tolist(),
+        "l2_b": model.head.bias.detach().cpu().numpy().tolist(),
+    }
+    with open("model_weights.json", "w", encoding="utf-8") as fh:
+        json.dump(weights,
